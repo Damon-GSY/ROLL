@@ -162,12 +162,97 @@ def encode_function(
     return encodings
 
 
-def get_vlm_dataset(data_args, encode_function, processor, get_eval=False):
+def filter_overlong_prompts(
+    dataset: datasets.Dataset,
+    processor: ProcessorMixin,
+    max_prompt_length: int,
+    prompt_key: str = "prompt",
+    image_key: str = "images",
+    image_flag_key: str = "image_flag",
+    num_proc: int = 8,
+) -> datasets.Dataset:
+    """Filter out samples where text + image tokens exceed max_prompt_length.
+
+    Note: Returns a new filtered dataset; the original dataset is not modified.
+
+    Args:
+        dataset: The dataset to filter (already encoded with formatted prompts and processed images).
+        processor: The processor to use for tokenization.
+        max_prompt_length: Maximum allowed token length (inclusive).
+        prompt_key: Key for the prompt text in the dataset.
+        image_key: Key for the images in the dataset.
+        image_flag_key: Key for the image flag indicating valid images.
+        num_proc: Number of processes for parallel filtering.
+
+    Returns:
+        Filtered dataset with samples within the token length limit.
+    """
+    original_len = len(dataset)
+    if original_len == 0:
+        logger.info("Dataset is empty, skipping filtering")
+        return dataset
+
+    def compute_token_count(example) -> int:
+        """Compute token count for a sample. Returns max_prompt_length + 1 on parse failure."""
+        try:
+            # Prompt is already formatted by encode_function, use directly
+            prompt = example[prompt_key]
+            if not isinstance(prompt, str):
+                # Fallback: apply chat template only if prompt is not already a string
+                prompt = processor.apply_chat_template(
+                    prompt, tokenize=False, add_generation_prompt=True
+                )
+
+            # Use already-processed images from encode_function
+            images = None
+            if example.get(image_flag_key) and example.get(image_key):
+                images = example[image_key]
+                # Handle single image or list of images
+                if not isinstance(images, list):
+                    images = [images]
+
+            # Calculate token length (same path as DataCollatorWithPaddingForMM)
+            inputs = processor(text=prompt, images=images)
+            input_ids = inputs["input_ids"][0]
+
+            return len(input_ids)
+
+        except Exception as e:
+            # Return max_prompt_length + 1 on any error to filter out the sample
+            logger.error(f"Error processing sample during filter, skipping: {e}")
+            return max_prompt_length + 1
+
+    filtered_dataset = dataset.filter(
+        lambda example: compute_token_count(example) <= max_prompt_length,
+        num_proc=num_proc,
+        desc=f"Keeping prompts with length <= {max_prompt_length} tokens",
+    )
+
+    filtered_len = len(filtered_dataset)
+    filtered_count = original_len - filtered_len
+    if filtered_count > 0:
+        logger.info(
+            f"Filtered {filtered_count}/{original_len} samples ({100 * filtered_count / original_len:.1f}%) "
+            f"exceeding max_prompt_length={max_prompt_length}. Remaining: {filtered_len}"
+        )
+    else:
+        logger.info(f"All {original_len} samples within max_prompt_length={max_prompt_length}")
+
+    return filtered_dataset
+
+
+def get_vlm_dataset(data_args, encode_function, processor, get_eval=False, max_prompt_length: Optional[int] = None):
     cache_path = getattr(data_args, "cache_path", None)
     if cache_path:
         cache_path = os.path.join(cache_path, "val" if get_eval else "train")
-    if cache_path and os.path.exists(cache_path):
+
+    # When max_prompt_length is specified, skip cache to ensure correct filtering.
+    # The cached dataset may have been filtered with a different max_prompt_length.
+    # Filtering is always done after loading/encoding, and we don't cache filtered results.
+    use_cache = cache_path and os.path.exists(cache_path) and max_prompt_length is None
+    if use_cache:
         dataset = load_from_disk(cache_path)
+        logger.info(f"Loaded dataset from cache: {cache_path}")
         return dataset
 
     dataset = get_dataset(data_args=data_args)
@@ -202,8 +287,31 @@ def get_vlm_dataset(data_args, encode_function, processor, get_eval=False):
         desc="Encoding dataset",
     )
     print(f"Encoding: {dataset}")
-    if cache_path:
+
+    # Filter out samples where text + image tokens exceed max_prompt_length
+    # This is done AFTER encoding but BEFORE saving to cache
+    # When max_prompt_length is set, we intentionally skip cache to ensure filtering is applied
+    if max_prompt_length is not None:
+        dataset = filter_overlong_prompts(
+            dataset=dataset,
+            processor=processor,
+            max_prompt_length=max_prompt_length,
+            prompt_key="prompt",
+            image_key="images",
+            image_flag_key="image_flag",
+            num_proc=data_args.preprocessing_num_workers,
+        )
+
+    # Only cache if no max_prompt_length filtering was applied
+    # This prevents caching filtered datasets which may have different max_prompt_length
+    if cache_path and max_prompt_length is None:
         dataset.save_to_disk(cache_path)
+        logger.info(f"Saved dataset to cache: {cache_path}")
+    elif cache_path and max_prompt_length is not None:
+        logger.info(
+            f"Skipping cache save because max_prompt_length={max_prompt_length} filtering was applied. "
+            "Next run will re-encode and re-filter with the same max_prompt_length."
+        )
     return dataset
 
 
@@ -222,7 +330,11 @@ class RLVRVLMPipeline(BasePipeline):
         self.tokenizer.padding_side = "left"
 
         dataset = get_vlm_dataset(
-            self.pipeline_config.actor_train.data_args, encode_function, self.processor, get_eval=False
+            self.pipeline_config.actor_train.data_args,
+            encode_function,
+            self.processor,
+            get_eval=False,
+            max_prompt_length=self.pipeline_config.prompt_length,
         )
         # update domain field, DynamicSamplingScheduler requires
         dataset = dataset.map(
@@ -244,7 +356,11 @@ class RLVRVLMPipeline(BasePipeline):
         self.val_dataset = None
         if self.pipeline_config.validation and self.pipeline_config.validation.data_args:
             self.val_dataset = get_vlm_dataset(
-                self.pipeline_config.validation.data_args, encode_function, self.processor, get_eval=True
+                self.pipeline_config.validation.data_args,
+                encode_function,
+                self.processor,
+                get_eval=True,
+                max_prompt_length=self.pipeline_config.prompt_length,
             )
             self.val_dataset = self.val_dataset.map(
                 partial(update_dataset_domain, self.pipeline_config.tag_2_domain),
